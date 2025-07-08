@@ -1,0 +1,5 @@
+{
+    "created_successfully": "created successfully 1",
+    "not_created_successfully": "not created successfully",
+    "string.empty": "{{{name}}} is not allowed to be empty"
+}
