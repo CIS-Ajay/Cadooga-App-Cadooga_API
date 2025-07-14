@@ -14,9 +14,17 @@ module.exports = {
             endpoint: '/user/update/',
             method: 'patch',
         },
+        UPDATE_PROFILE_ADMIN: {
+            endpoint: '/super_admin/update/user/',
+            method: 'patch',
+        },      
         DELETE_ACCOUNT: {
             endpoint: "/user/delete/",
             method: "delete"
+        },
+        RESET_PASSWORD: {
+            endpoint: '/user/update-password/',
+            method: 'patch',
         },
     },
 };

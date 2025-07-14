@@ -23,7 +23,7 @@ module.exports = class AdminValidation {
       legal_first_name: Joi.string().optional(),
       legal_last_name: Joi.string().optional(),
       role: Joi.number().valid(0, 1).required(), // 0 = super_admin, 1 = admin
-      is_email_verified: Joi.number().valid(0, 1).required(),
+      is_email_verified: Joi.boolean().optional().default(false),
     };
 
     const errors = await _DataHelper.joiValidation(req.body, schema);

@@ -15,9 +15,60 @@ const _Admin = new AdminResource();
 const UsersResource = require("../../v1/users/users.resources");
 const _User = new UsersResource();
 
+const NodeMailerService = require("../../../services/nodemailer");
+const _NodeMailer = new NodeMailerService();
+
+const djangoEndpoints = require("../../../config/djangoEndpoints");
+const { enqueueDjangoSync } = require("../../../services/enqueueDjangoSync");
+const { forwardToDjango } = require("../../../services/djangoService");
+const jwt = require("jsonwebtoken");
 const createCsvStringifier = require('csv-writer').createObjectCsvStringifier;
 
+const { generateResetEmailHtml } = require("../../../emailTemplates/resetEmail");
 module.exports = class AdminController {
+
+  async sendPasswordReset(req, res) {
+    const { email } = req.body;
+  
+    if (!email) {
+      return res.status(400).json({ message: "Email is required." });
+    }
+  
+    try {
+      const user = await _User.getByEmail(email);
+      console.log('user:', user);
+      if (!user) return response.notFound("User not found.", res);
+  
+      // Generate a JWT token with 15-minute expiry
+      const token = jwt.sign(
+        { id: user.id, email: user.email },
+        process.env.JWT_SECRET,
+        { expiresIn: "5m" }
+      );
+  
+      const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${token}`;
+  
+      const html = await generateResetEmailHtml(resetUrl, user);
+  
+      const sent = await _NodeMailer.sendMailNodemailer(
+        process.env.SUPPORT_MAIL,
+        email,
+        "Reset your password",
+        html
+      );
+  
+      if (!sent) {
+        return response.exception("Failed to send email", res);
+      }
+  
+      return response.success("Reset link sent to email.", res, resetUrl);
+  
+    } catch (err) {
+      console.error("resendOtp error", err);
+      return response.internalServerError("Server error", res);
+    }
+  }
+
   async login(req, res) {
     console.log("AdminController@login");
     const { email, password } = req.body;
@@ -83,12 +134,7 @@ module.exports = class AdminController {
 
   async createOne(req, res) {
     console.log("AdminController@createOne");
-    const data = _.pick(req.body, [
-      "email",
-      "password",
-      "legal_first_name",
-      "legal_last_name"
-    ]);
+    const data = _.pick(req.body, ["email", "password", "legal_first_name", "legal_last_name" ]);
 
     try {
       const exists = await _Admin.getByEmail(data.email);
@@ -100,15 +146,60 @@ module.exports = class AdminController {
       data.is_email_verified = true;
 
       const created = await _Admin.createOne(data);
-      res.status(201).json({
-        success: true,
-        message: 'Admin created successfully',
+
+      // Prepare Django sync payload
+      const config = djangoEndpoints.AUTH.REGISTER;
+      const djangoPayload = {
+        endpoint: config.endpoint,
+        method: config.method,
         data: {
           id: created.id,
-          email: created.email
+          email: created.email,
+          password: req.body.password, // Send raw password to Django
+          legal_first_name: data.legal_first_name,
+          legal_last_name: data.legal_last_name,
+          role: data.role,
+          is_verified: true,
+          is_email_verified: true,
+        },
+      };
+      try {
+        await forwardToDjango(djangoPayload);
+  
+        return res.status(201).json({
+          success: true,
+          message: 'Admin created and synced with Django successfully',
+          data: {
+            id: created.id,
+            email: created.email,
+          }
+        });
+  
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+  
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "sync-admin",
+            payload: { ...djangoPayload, id: created.id }
+          });
+  
+          return res.status(201).json({
+            success: true,
+            message: "Admin created. Django sync is queued.",
+            data: {
+              id: created.id,
+              email: created.email,
+            },
+          });
         }
-      });
-            // return response.success("Admin created", res, created);
+  
+        return res.status(err.status || 500).json({
+          success: false,
+          message: "Django sync failed",
+          error: typeof err.message === 'object' ? err.message : { error: err.message },
+        });
+      }  
     } catch (err) {
       console.error("Create error:", err);
       return response.internalServerError("Failed to create admin", res, err.message);
@@ -125,8 +216,47 @@ module.exports = class AdminController {
     ]);
 
     try {
-      const updated = await _Admin.updateOne(id, updateData);
-      return response.success("Admin updated", res, updated);
+      const updatedAdmin = await _Admin.updateOne(id, updateData);
+      if (!updatedAdmin) {
+        return response.exception("Admin not found or update failed", res, false);
+      }
+
+      // Prepare payload for Django sync
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE;
+      const djangoPayload = {
+        endpoint: config.endpoint,
+        method: config.method,
+        data: {
+          email: updatedAdmin.email,
+          legal_first_name: updatedAdmin.legal_first_name,
+          legal_last_name: updatedAdmin.legal_last_name,
+        },
+        headers: {
+          Authorization: req.headers["authorization"]
+        }
+      };
+
+      try {
+        await forwardToDjango(djangoPayload);
+        return response.success("Admin updated and synced", res, updatedAdmin);  
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "update-admin",
+            payload: {
+              ...djangoPayload,
+              id: updatedAdmin.id,
+            }
+          });
+          return response.success("Admin updated. Django sync is queued.", res, updatedAdmin);
+        }
+        return res.status(err.status || 500).json({
+          status_code: err.status || 500,
+          message: err.message || "Failed to sync with Django",
+          data: {},
+        });
+      }
     } catch (err) {
       console.error("Update error:", err);
       return response.internalServerError("Failed to update admin", res, err.message);
@@ -170,8 +300,6 @@ module.exports = class AdminController {
       if (!user) {
         return response.notFound("User not found", res);
       }
-
-      // Remove sensitive fields
       delete user.password;
 
       return response.success("Profile fetched", res, user);
@@ -238,33 +366,75 @@ module.exports = class AdminController {
   };
 
   async updateUser(req, res) {
-  try {
-    const userId = req.params.id;
-    const userData = req.body;
-    
-    // Log update information for debugging
-    console.log(`Updating user ${userId} with data:`, userData);
-    
-    // Validate user exists
-    const existingUser = await _User.getUserById(userId);
-    if (!existingUser) {
-      return res.status(404).json({ message: 'User not found' });
+    try {
+      const userId = req.params.id;
+      const userData = req.body;
+      
+      // Log update information for debugging
+      console.log(`Updating user ${userId} with data:`, userData);
+      
+      // Validate user exists
+      const existingUser = await _User.getUserById(userId);
+      if (!existingUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      // Update user data
+      const success = await _User.updateUser(userId, userData);
+      
+      if (!success) {
+        return res.status(400).json({ message: 'Failed to update user' });
+      }
+      
+      // Get updated user data
+      const updatedUser = await _User.getUserById(userId);
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+      // Prepare Django sync payload
+      const djangoPayload = {
+        endpoint: `${config.endpoint}${updatedUser.id}/`,
+        method: config.method,
+        data: {
+          legal_first_name: updatedUser.legal_first_name,
+          legal_last_name: updatedUser.legal_last_name,
+          nickname: updatedUser.nickname,
+        },
+        headers: {
+          Authorization: req.headers["authorization"],
+        },
+      };  
+        try {
+        const ress = await forwardToDjango(djangoPayload);
+        console.log('ress:===', ress);
+        return res.json({ message: 'User updated successfully', user: updatedUser });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+  
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "update-user",
+            payload: {
+              ...djangoPayload,
+              id: updatedUser.id
+            }
+          });
+  
+          return res.json({
+            message: 'User updated successfully. Django sync is queued.',
+            user: updatedUser
+          });
+        }
+  
+        return res.status(err.status || 500).json({
+          message: err.message || 'Failed to sync with Django',
+          error: err
+        });
+      }
+  
+      // res.json({ message: 'User updated successfully', user: updatedUser });
+    } catch (error) {
+      console.error(`Error in updateUser controller for ID ${req.params.id}:`, error);
+      res.status(500).json({ message: 'Server error', error: error.message });
     }
-    
-    // Update user data
-    const success = await _User.updateUser(userId, userData);
-    
-    if (!success) {
-      return res.status(400).json({ message: 'Failed to update user' });
-    }
-    
-    // Get updated user data
-    const updatedUser = await _User.getUserById(userId);
-    res.json({ message: 'User updated successfully', user: updatedUser });
-  } catch (error) {
-    console.error(`Error in updateUser controller for ID ${req.params.id}:`, error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
   };
 
   async clearDeviceId(req, res) {
@@ -283,43 +453,122 @@ module.exports = class AdminController {
     if (!success) {
       return res.status(400).json({ message: 'Failed to clear device ID' });
     }
-    
-    res.json({ message: 'Device ID cleared successfully' });
+    // Get updated user
+    const updatedUser = await _User.getUserById(userId);
+
+    const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+    const djangoPayload = {
+      endpoint: `${config.endpoint}${updatedUser.id}/`,
+      method: config.method,
+      data: {
+        face_token: null
+      },
+      headers: {
+        Authorization: req.headers["authorization"]
+      }
+    };
+
+    try {
+      await forwardToDjango(djangoPayload);
+      return res.json({ message: 'Device ID cleared successfully' });
+    } catch (err) {
+      const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+
+      if (isRetryable) {
+        await enqueueDjangoSync({
+          jobIdPrefix: "update-user-device",
+          payload: {
+            ...djangoPayload,
+            id: updatedUser.id
+          }
+        });
+
+        return res.json({
+          message: 'Device ID cleared. Django sync is queued.'
+        });
+      }
+
+      return res.status(err.status || 500).json({
+        message: err.message || 'Failed to sync with Django',
+        error: err
+      });
+    }
   } catch (error) {
     console.error(`Error in clearDeviceId controller for ID ${req.params.id}:`, error);
     res.status(500).json({ message: 'Server error', error: error.message });
   }
   };
 
-  async resetPassword1(req, res) {
+  async resetPasswordByToken(req, res) {
     try {
-      const userId = req.params.id;
-      const { newPassword } = req.body;
-      
-      if (!newPassword || newPassword.length < 8) {
-        return res.status(400).json({ message: 'Password must be at least 8 characters long' });
+      const { token, password } = req.body;
+      console.log('token, password:', token, password);
+      if (!token || !password || password.length < 8) {
+        return res.status(400).json({ message: 'Invalid token or password too short' });
       }
-      
-      // Validate user exists
-      const existingUser = await _User.getUserById(userId);
-      if (!existingUser) {
-        return res.status(404).json({ message: 'User not found' });
+  
+      let decoded;
+      try {
+        decoded = jwt.verify(token, process.env.JWT_SECRET);
+      } catch (err) {
+        return res.status(401).json({ message: "Invalid or expired token" });
       }
-      
-      // Reset password
-      const success = await _User.resetPassword(userId, newPassword);
-      
+  
+      const userId = decoded.id;
+  
+      const user = await _User.getUserById(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+  
+      const hashedPassword = await bcrypt.hash(password, 10);
+  
+      const success = await _User.updateOne(userId, {
+        password: hashedPassword,
+      });
+      console.log('success:====', success);
+  
       if (!success) {
         return res.status(400).json({ message: 'Failed to reset password' });
       }
       
-      res.json({ message: 'Password reset successfully' });
+      // django sync
+      const config = djangoEndpoints.AUTH.RESET_PASSWORD;
+      const djangoPayload = {
+        endpoint: config.endpoint,
+        method: config.method,
+        data: {
+          password: password,
+        },
+      };
+      try {
+        await forwardToDjango(djangoPayload);
+        console.log('Password reset successfully and synced with Django');
+        return res.status(200).json({ message: 'Password reset successfully' });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "reset-password",
+            payload: { ...djangoPayload, id: userId },
+          });
+          console.log('Password reset successfully. Django sync is queued.');
+          return res.status(200).json({
+            message: 'Password reset successfully. Django sync is queued.'
+          });
+        }
+        console.error('Failed to sync password reset with Django:', err);
+        return res.status(err.status || 500).json({
+          message: err.message || 'Failed to sync with Django',
+          error: err
+        });
+      }  
     } catch (error) {
-      console.error(`Error in resetPassword controller for ID ${req.params.id}:`, error);
-      res.status(500).json({ message: 'Server error', error: error.message });
+      console.error("Error resetting password:", error);
+      return res.status(500).json({ message: "Server error", error: error.message });
     }
-  };
-
+  }
+  
   async updateSubscription(req, res) {
   try {
     const userId = req.params.id;
@@ -504,20 +753,45 @@ module.exports = class AdminController {
       
       // Ban the user by updating account status
       const success = await _User.updateAccountStatus(userId, 'banned');
-      
       if (!success) {
-        return res.status(400).json({ 
+        return res.status(400).json({ success: false, message: 'Failed to ban user' });
+      }
+
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+      const djangoPayload = {
+        endpoint: `${config.endpoint}${userId}/`,
+        method: config.method,
+        data: {
+          theliveapp_status: false,
+        },
+        headers: {
+          Authorization: req.headers["authorization"],
+        },
+      };
+  
+      console.log(`User ${userId} banned successfully`);
+      try {
+        await forwardToDjango(djangoPayload);
+        return res.json({ success: true, message: 'User banned successfully' });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "ban-user",
+            payload: { ...djangoPayload, id: userId },
+          });
+          return res.json({
+            success: true,
+            message: 'User banned. Django sync is queued.',
+          });
+        }
+        return res.status(err.status || 500).json({
           success: false,
-          message: 'Failed to ban user' 
+          message: 'Ban failed during Django sync.',
+          error: err.message || err,
         });
       }
-      
-      console.log(`User ${userId} banned successfully`);
-      res.json({ 
-        success: true,
-        message: 'User banned successfully' 
-      });
-    } catch (error) {
+      } catch (error) {
       console.error(`Error in banUser controller for ID ${req.params.id}:`, error);
       res.status(500).json({ 
         success: false,
@@ -531,101 +805,175 @@ module.exports = class AdminController {
  * Unban a user
  */
   async unbanUser(req, res) {
-  try {
-    const userId = req.params.id;
-    
-    console.log(`Attempting to unban user ${userId}`);
-    
-    // Validate user exists
-    const existingUser = await _User.getUserById(userId);
-    if (!existingUser) {
-      return res.status(404).json({ 
+    try {
+      const userId = req.params.id;
+      
+      console.log(`Attempting to unban user ${userId}`);
+      
+      // Validate user exists
+      const existingUser = await _User.getUserById(userId);
+      if (!existingUser) {
+        return res.status(404).json({ 
+          success: false,
+          message: 'User not found' 
+        });
+      }
+      
+      const success = await _User.updateAccountStatus(userId, 'active');
+      if (!success) {
+        return res.status(400).json({ success: false, message: 'Failed to unban user' });
+      }
+
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+      const djangoPayload = {
+        endpoint: `${config.endpoint}${userId}/`,
+        method: config.method,
+        data: {
+          theliveapp_status: true,
+          deleted_at: null,
+        },
+        headers: {
+          Authorization: req.headers["authorization"],
+        },
+      };
+
+      try {
+        await forwardToDjango(djangoPayload);
+        return res.json({ success: true, message: 'User unbanned successfully' });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "unban-user",
+            payload: { ...djangoPayload, id: userId },
+          });
+          return res.json({
+            success: true,
+            message: 'User unbanned. Django sync is queued.',
+          });
+        }
+        return res.status(err.status || 500).json({
+          success: false,
+          message: 'Unban failed during Django sync.',
+          error: err.message || err,
+        });
+      }
+    } catch (error) {
+      console.error(`Error in unbanUser controller for ID ${req.params.id}:`, error);
+      res.status(500).json({ 
         success: false,
-        message: 'User not found' 
+        message: 'Server error', 
+        error: error.message 
       });
     }
-    
-    // Unban the user by updating account status to active
-    const success = await _User.updateAccountStatus(userId, 'active');
-    
-    if (!success) {
-      return res.status(400).json({ 
-        success: false,
-        message: 'Failed to unban user' 
-      });
-    }
-    
-    console.log(`User ${userId} unbanned successfully`);
-    res.json({ 
-      success: true,
-      message: 'User unbanned successfully' 
-    });
-  } catch (error) {
-    console.error(`Error in unbanUser controller for ID ${req.params.id}:`, error);
-    res.status(500).json({ 
-      success: false,
-      message: 'Server error', 
-      error: error.message 
-    });
-  }
   };
 
 /**
  * Verify a user - Updated to only use is_email_verified
  */
   async verifyUser(req, res) {
-  try {
     const userId = req.params.id;
-    
-    // Validate user exists
-    const existingUser = await _User.getUserById(userId);
-    if (!existingUser) {
-      return res.status(404).json({ message: 'User not found' });
+    try {
+      const existingUser = await _User.getUserById(userId);
+      if (!existingUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      const success = await _User.updateUser(userId, { is_email_verified: true });
+      if (!success) {
+        return res.status(400).json({ message: 'Failed to verify user' });
+      }
+      // Prepare payload for Django sync
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+      const djangoPayload = {
+        endpoint: `${config.endpoint}${userId}/`,
+        method: config.method,
+        data: {
+          is_email_verified: true,
+        },
+        headers: {
+          Authorization: req.headers["authorization"],
+        },
+      };
+
+
+      try {
+        await forwardToDjango(djangoPayload);
+        return res.json({ message: 'User verified successfully' });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "verify-user",
+            payload: { ...djangoPayload, id: userId },
+          });
+          return res.json({
+            message: 'User verified. Django sync is queued.',
+          });
+        }
+
+        return res.status(err.status || 500).json({
+          message: 'Verification failed during Django sync.',
+          error: err.message || err,
+        });
+      }
+    } catch (error) {
+      console.error(`Error in verifyUser controller for ID ${req.params.id}:`, error);
+      res.status(500).json({ message: 'Server error', error: error.message });
     }
-    
-    // Update only the is_email_verified field
-    const success = await _User.updateUser(userId, { 
-      is_email_verified: true 
-    });
-    
-    if (!success) {
-      return res.status(400).json({ message: 'Failed to verify user' });
-    }
-    
-    res.json({ message: 'User verified successfully' });
-  } catch (error) {
-    console.error(`Error in verifyUser controller for ID ${req.params.id}:`, error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
- };
+  };
 
 /**
  * Remove verification from a user - Updated to only use is_email_verified
  */
   async removeVerification(req, res){
-  try {
     const userId = req.params.id;
-    
-    // Validate user exists
-    const existingUser = await _User.getUserById(userId);
-    if (!existingUser) {
-      return res.status(404).json({ message: 'User not found' });
+    try {
+      // Validate user exists
+      const existingUser = await _User.getUserById(userId);
+      if (!existingUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      // Update only the is_email_verified field
+      const success = await _User.updateUser(userId, { is_email_verified: false });
+      
+      if (!success) {
+        return res.status(400).json({ message: 'Failed to remove verification' });
+      }
+      // Prepare payload for Django sync
+      const config = djangoEndpoints.AUTH.UPDATE_PROFILE_ADMIN;
+      const djangoPayload = {
+        endpoint: `${config.endpoint}${userId}/`,
+        method: config.method,
+        data: { is_email_verified: false },
+        headers: { Authorization: req.headers["authorization"] },
+      };
+
+      try {
+        await forwardToDjango(djangoPayload);
+        return res.json({ message: 'User verification removed successfully' });
+      } catch (err) {
+        const isRetryable = err.status >= 500 || err.code === "ECONNABORTED";
+        if (isRetryable) {
+          await enqueueDjangoSync({
+            jobIdPrefix: "remove-verification",
+            payload: { ...djangoPayload, id: userId },
+          });
+          return res.json({
+            message: 'User verification removed. Django sync is queued.',
+          });
+        }
+
+        return res.status(err.status || 500).json({
+          message: 'Django sync failed during verification removal.',
+          error: err.message || err,
+        });
+      }
+    } catch (error) {
+      console.error(`Error in removeVerification controller for ID ${req.params.id}:`, error);
+      res.status(500).json({ message: 'Server error', error: error.message });
     }
-    
-    // Update only the is_email_verified field
-    const success = await _User.updateUser(userId, { 
-      is_email_verified: false 
-    });
-    
-    if (!success) {
-      return res.status(400).json({ message: 'Failed to remove verification' });
-    }
-    
-    res.json({ message: 'User verification removed successfully' });
-  } catch (error) {
-    console.error(`Error in removeVerification controller for ID ${req.params.id}:`, error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
   };
 
   async healthCheck(req, res) {

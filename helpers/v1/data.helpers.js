@@ -49,15 +49,6 @@ module.exports = class DataHelper {
 
         return hashedValue;
     }
-    
-    // async generateToken(data){
-    //     console.log("DataHelper@generateToken");
-    //     let token = jwt.sign(data, process.env.JWT_TOKEN_KEY);
-    //     if(!token){
-    //         return false
-    //     }
-    //     return token
-    // }
 
     async generateToken(data){
         console.log("DataHelper@generateToken");

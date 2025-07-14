@@ -35,5 +35,8 @@
 	"Invalid request data, Please add file to request.": "Invalid request data, Please add file to request.",
 	"Profile fetched": "Profile fetched",
 	"invalid algorithm": "invalid algorithm",
-	"Mock links fetched": "Mock links fetched"
+	"Mock links fetched": "Mock links fetched",
+	"jwt expired": "jwt expired",
+	"Reset link sent to email.": "Reset link sent to email.",
+	"User not found.": "User not found."
 }
