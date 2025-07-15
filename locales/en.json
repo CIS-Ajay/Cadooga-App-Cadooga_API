@@ -38,5 +38,6 @@
 	"Mock links fetched": "Mock links fetched",
 	"jwt expired": "jwt expired",
 	"Reset link sent to email.": "Reset link sent to email.",
-	"User not found.": "User not found."
+	"User not found.": "User not found.",
+	"Invalid password reset": "Invalid password reset"
 }

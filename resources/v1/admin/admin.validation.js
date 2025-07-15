@@ -45,7 +45,8 @@ module.exports = class AdminValidation {
 
   async resetPassword(req, res, next) {
     const schema = {
-      newPassword: Joi.string().min(8).required()
+      password: Joi.string().min(8).required(),
+      token: Joi.string().required()
     };
 
     const errors = await _DataHelper.joiValidation(req.body, schema);

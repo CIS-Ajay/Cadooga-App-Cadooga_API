@@ -538,7 +538,8 @@ module.exports = class AdminController {
         endpoint: config.endpoint,
         method: config.method,
         data: {
-          password: password,
+          password,
+          id: userId,
         },
       };
       try {
@@ -550,7 +551,7 @@ module.exports = class AdminController {
         if (isRetryable) {
           await enqueueDjangoSync({
             jobIdPrefix: "reset-password",
-            payload: { ...djangoPayload, id: userId },
+            payload: djangoPayload,
           });
           console.log('Password reset successfully. Django sync is queued.');
           return res.status(200).json({

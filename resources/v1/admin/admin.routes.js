@@ -32,14 +32,14 @@ routes.get("/users/:id", [auth.auth], admin.getUserById);
 routes.put("/users/:id", [auth.auth], admin.updateUser); //django sync Done
 // routes.patch("/users/:id", [auth.auth], admin.updateUser);
 routes.patch("/users/:id/clear-device", [auth.auth], admin.clearDeviceId); //django sync Done
-routes.post("/users/reset-password", [auth.auth, validate.resetPassword], admin.resetPasswordByToken); //django sync Done
+routes.post("/users/reset-password", [validate.resetPassword], admin.resetPasswordByToken); //django sync Done
 routes.patch("/users/:id/subscription", [auth.auth], admin.updateSubscription); //django sync no need yet
 routes.patch("/users/:id/status", [auth.auth], admin.updateAccountStatus); //django sync no need yet
 routes.post("/users/:id/ban", [auth.auth], admin.banUser); //django sync Done
 routes.post("/users/:id/unban", [auth.auth], admin.unbanUser); //django sync Done
 routes.post("/users/:id/verify", [auth.auth], admin.verifyUser); //django sync Done
 routes.post("/users/:id/remove-verification", [auth.auth], admin.removeVerification); //django sync Done
-routes.post("/send-password-reset", [auth.auth], admin.sendPasswordReset);
+routes.post("/send-password-reset", admin.sendPasswordReset);
 
 
 // Generic admin CRUD
